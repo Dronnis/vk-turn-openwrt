@@ -211,7 +211,7 @@ jobs:
           export CCACHE_COMPRESS="1"
           export CCACHE_SLOPPINESS="file_macro,system_headers,time_macros"
 
-          make package/custom/$PKG/compile V=s
+          make package/custom/$PKG/compile Q=1
           ccache -s 2>/dev/null || true
 
           mkdir -p ../output
