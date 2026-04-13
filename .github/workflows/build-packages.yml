@@ -102,62 +102,66 @@ jobs:
             386)     echo "target_path=x86/generic" >> $GITHUB_OUTPUT ;;
           esac
 
-      - name: Parse SDK download link from releases page
+      - name: Parse SDK download link
         id: sdk_link
         run: |
           OWRT="${{ matrix.openwrt_version }}"
           TARGET_PATH="${{ steps.target_map.outputs.target_path }}"
           BASE_URL="https://downloads.openwrt.org/releases/${OWRT}/targets/${TARGET_PATH}/"
-          
-          echo "🔍 Fetching: $BASE_URL"
           PAGE=$(curl -sL "$BASE_URL")
-          
-          # 🔧 Исправленный regex: ищем SDK файл для нашей версии
-          # Используем -E для расширенных регулярок и более простой паттерн
           SDK_LINK=$(echo "$PAGE" | grep -oE "openwrt-sdk-${OWRT}-[^\"]+\.tar\.(xz|zst)" | head -1)
-          
           if [ -z "$SDK_LINK" ]; then
             echo "❌ SDK not found for ${OWRT}/${TARGET_PATH}"
-            echo "🔎 Available archives containing 'sdk' or 'tar':"
-            echo "$PAGE" | grep -oE 'href="[^"]+\.(tar\.xz|tar\.zst|tar\.gz)"' | head -10 || true
+            echo "$PAGE" | grep -oE 'href="[^"]+\.(tar\.xz|tar\.zst)"' | head -10 || true
             exit 1
           fi
-          
-          echo "✅ Found SDK: $SDK_LINK"
-          
-          # Определяем расширение и команду распаковки
+          echo "✅ SDK: $SDK_LINK"
           if [[ "$SDK_LINK" == *.zst ]]; then
-            EXT="zst"
-            EXTRACT_CMD="tar --zstd -xf"
+            echo "ext=zst" >> $GITHUB_OUTPUT
+            echo "extract_cmd=tar --zstd -xf" >> $GITHUB_OUTPUT
           else
-            EXT="xz"
-            EXTRACT_CMD="tar -xf"
+            echo "ext=xz" >> $GITHUB_OUTPUT
+            echo "extract_cmd=tar -xf" >> $GITHUB_OUTPUT
           fi
-          
           echo "sdk_url=${BASE_URL}${SDK_LINK}" >> $GITHUB_OUTPUT
-          echo "ext=$EXT" >> $GITHUB_OUTPUT
-          echo "extract_cmd=$EXTRACT_CMD" >> $GITHUB_OUTPUT
-          
-          # Пакетный менеджер и расширение пакета
           if [[ "$OWRT" == 25.12.* ]]; then
             echo "pkg_ext=apk" >> $GITHUB_OUTPUT
-            echo "pkg_mgr=apk" >> $GITHUB_OUTPUT
           else
             echo "pkg_ext=ipk" >> $GITHUB_OUTPUT
-            echo "pkg_mgr=opkg" >> $GITHUB_OUTPUT
           fi
 
-      - name: Install zstd
+      - name: Install zstd if needed
         if: steps.sdk_link.outputs.ext == 'zst'
         run: sudo apt-get update && sudo apt-get install -y zstd
 
       - name: Download & extract SDK
         run: |
-          curl -L --retry 3 -o "sdk.tar.${{ steps.sdk_link.outputs.ext }}" \
-            "${{ steps.sdk_link.outputs.sdk_url }}"
+          curl -L --retry 3 -o "sdk.tar.${{ steps.sdk_link.outputs.ext }}" "${{ steps.sdk_link.outputs.sdk_url }}"
           ${{ steps.sdk_link.outputs.extract_cmd }} "sdk.tar.${{ steps.sdk_link.outputs.ext }}"
           mv openwrt-sdk-* openwrt
-          rm "sdk.tar."*
+          rm -f sdk.tar.*
+          mkdir -p openwrt/dl
+
+      # 🔥 Кэш 1: Скачанные исходники (dl/)
+      - name: Cache OpenWRT downloads
+        uses: actions/cache@v4
+        with:
+          path: openwrt/dl
+          key: owrt-dl-${{ matrix.openwrt_version }}-${{ hashFiles('packages/**/Makefile') }}
+          restore-keys: |
+            owrt-dl-${{ matrix.openwrt_version }}-
+
+      # 🔥 Кэш 2: Компилятор (ccache)
+      - name: Cache ccache
+        uses: actions/cache@v4
+        with:
+          path: ~/.ccache
+          key: ccache-${{ matrix.openwrt_version }}-${{ matrix.arch }}-${{ hashFiles('packages/**/Makefile') }}
+          restore-keys: |
+            ccache-${{ matrix.openwrt_version }}-${{ matrix.arch }}-
+
+      - name: Install ccache
+        run: sudo apt-get update && sudo apt-get install -y ccache
 
       - name: Prepare package & compile
         run: |
@@ -165,30 +169,36 @@ jobs:
           PKG="${{ matrix.package }}"
           OWRT="${{ matrix.openwrt_version }}"
           PKG_EXT="${{ steps.sdk_link.outputs.pkg_ext }}"
-          
-          # Копируем пакет
+
           mkdir -p openwrt/package/custom/$PKG
           cp -r packages/$PKG/* openwrt/package/custom/$PKG/
           sed -i "s/^PKG_VERSION:=.*/PKG_VERSION:=$VER/" openwrt/package/custom/$PKG/Makefile
-          
-          # Feeds
+
           echo "src-link custom $GITHUB_WORKSPACE/openwrt/package/custom" >> openwrt/feeds.conf.default
-          
+
           cd openwrt
           ./scripts/feeds update -a 2>/dev/null || true
           ./scripts/feeds install -a 2>/dev/null || true
           make defconfig
+
+          # 🚀 Активируем ccache
+          export PATH="/usr/lib/ccache:$PATH"
+          export CCACHE_DIR="$HOME/.ccache"
+          export CCACHE_MAXSIZE="1G"
+          export CCACHE_COMPRESS="1"
+          export CCACHE_SLOPPINESS="file_macro,system_headers,time_macros"
+
           make package/custom/$PKG/compile V=s
-          
-          # Собираем артефакты
+
+          # Статистика кэша (для отладки)
+          ccache -s 2>/dev/null || true
+
           mkdir -p ../output
           find bin/packages -name "${PKG}_*.${PKG_EXT}" -exec cp {} ../output/ \;
           cd ../output
           for f in ${PKG}_*.${PKG_EXT}; do
-            base="${f%.${PKG_EXT}}"
-            mv "$f" "${base}_${OWRT}.${PKG_EXT}"
+            mv "$f" "${f%.${PKG_EXT}}_${OWRT}.${PKG_EXT}"
           done
-          ls -la
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -196,7 +206,6 @@ jobs:
           name: ${{ matrix.package }}-${{ matrix.arch }}-${{ matrix.openwrt_version }}
           path: output/*.${{ steps.sdk_link.outputs.pkg_ext }}
           retention-days: 7
-
   # 4️⃣ Публикация релиза
   release:
     needs: [check-updates, build]
