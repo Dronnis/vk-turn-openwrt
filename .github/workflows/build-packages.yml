@@ -193,8 +193,8 @@ jobs:
           PKG="${{ matrix.package }}"
           OWRT="${{ matrix.openwrt_version }}"
           PKG_EXT="${{ steps.sdk_link.outputs.pkg_ext }}"
+          ARCH="${{ matrix.arch }}"
 
-          # Подготовка пакета в SDK
           mkdir -p openwrt/package/custom/$PKG
           cp -r packages/$PKG/* openwrt/package/custom/$PKG/
           sed -i "s/^PKG_VERSION:=.*/PKG_VERSION:=$VER/" openwrt/package/custom/$PKG/Makefile
@@ -204,39 +204,39 @@ jobs:
           ./scripts/feeds update -a >/dev/null 2>&1
           ./scripts/feeds install -a >/dev/null 2>&1
           make defconfig >/dev/null 2>&1
-          
-          # Сборка (убран V=s, чтобы логи не обрезались GitHub)
           make package/custom/$PKG/compile 2>&1 | tail -n 30
           cd "$GITHUB_WORKSPACE"
 
-          # 🔍 Умный поиск скомпилированного пакета
           mkdir -p output
-          
           if [ "$PKG_EXT" = "apk" ]; then
-            # Для OpenWRT 25.12+ (apk): имя-версия.apk
             PACKAGE_FILE=$(find openwrt/bin -type f -name "${PKG}-*.${PKG_EXT}" | head -n 1)
           else
-            # Для OpenWRT 23.05/24.10 (ipk): имя_версия_архитектура.ipk
             PACKAGE_FILE=$(find openwrt/bin -type f -name "${PKG}_*.${PKG_EXT}" | head -n 1)
           fi
 
           if [ -z "$PACKAGE_FILE" ]; then
-            echo "❌ ERROR: Package not found with pattern for ${PKG_EXT}!"
-            echo "📂 Listing openwrt/bin/packages:"
-            find openwrt/bin/packages -type f -name "*.${PKG_EXT}" 2>/dev/null | head -10 || echo "(empty)"
+            echo "❌ ERROR: Package not found!"
+            find openwrt/bin/packages -type f -name "*.${PKG_EXT}" 2>/dev/null | head -5 || echo "(empty)"
             exit 1
           fi
 
-          echo "✅ Found package: $PACKAGE_FILE"
+          echo "✅ Found: $PACKAGE_FILE"
           cp "$PACKAGE_FILE" output/
           cd output
 
-          # Переименование с добавлением версии OpenWRT
           ORIGINAL=$(basename "$PACKAGE_FILE")
-          NEW_NAME="${ORIGINAL%.${PKG_EXT}}_${OWRT}.${PKG_EXT}"
+
+          # 🔧 УНИФИЦИРОВАННОЕ ПЕРЕИМЕНОВАНИЕ
+          if [ "$PKG_EXT" = "apk" ]; then
+            # Apk не содержит архитектуру -> добавляем её явно
+            NEW_NAME="${ORIGINAL%.${PKG_EXT}}_${ARCH}_${OWRT}.${PKG_EXT}"
+          else
+            # Ipk уже содержит архитектуру -> просто добавляем версию OpenWRT
+            NEW_NAME="${ORIGINAL%.${PKG_EXT}}_${OWRT}.${PKG_EXT}"
+          fi
+
           mv "$ORIGINAL" "$NEW_NAME"
-          echo "📦 Ready for upload: $NEW_NAME"
-          ls -la
+          echo "📦 Output: $NEW_NAME"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -262,35 +262,30 @@ jobs:
       - name: Generate release notes
         run: |
           VER="${{ needs.check-updates.outputs.version }}"
-          cat > notes.md <<'HEADER'
-            ## 📦 vk-turn-proxy for OpenWRT v
-          HEADER
-          echo "HEADER" > notes.md
-          echo "## 📦 vk-turn-proxy for OpenWRT v${VER}" > notes.md
-          echo "" >> notes.md
-          echo "> Бинарники взяты из [upstream release v${VER}](https://github.com/${{ env.UPSTREAM_REPO }}/releases/tag/v${VER})" >> notes.md
-          echo "" >> notes.md
-          
-          for owrt in "23.05.5 (opkg)" "24.10.6 (opkg)" "25.12.2 (apk)"; do
-            owrt_ver="${owrt%% *}"
-            pkg_mgr="${owrt##* }"
-            pkg_ext="ipk"
-            [ "$pkg_mgr" = "apk" ] && pkg_ext="apk"
-            
-            echo -e "\n### 📂 OpenWRT ${owrt_ver} — ${pkg_mgr} (\`.${pkg_ext}\`)" >> notes.md
-            echo '```' >> notes.md
-            find ./release-files -name "*_${owrt_ver}.${pkg_ext}" -exec basename {} \; 2>/dev/null | sort | sed 's/^/  /' >> notes.md || echo "  (no packages)" >> notes.md
-            echo '```' >> notes.md
-          done
-          
-          echo -e "\n### ⚙️ Установка" >> notes.md
-          echo '```bash' >> notes.md
-          echo '# Для OpenWRT 23.05 / 24.10 (opkg):' >> notes.md
-          echo 'opkg install vk-turn-client_*.ipk' >> notes.md
-          echo '' >> notes.md
-          echo '# Для OpenWRT 25.12+ (apk):' >> notes.md
-          echo 'apk add --allow-untrusted vk-turn-client_*.apk' >> notes.md
-          echo '```' >> notes.md
+          {
+          echo "## 📦 vk-turn-proxy for OpenWRT v${VER}"
+          echo "> Бинарники взяты из [upstream release v${VER}](https://github.com/${{ env.UPSTREAM_REPO }}/releases/tag/v${VER})"
+          echo ""
+          echo "### 📂 OpenWRT 23.05.5 & 24.10.6 (opkg / \`.ipk\`)"
+          echo '```'
+          find ./release-files \( -name "*_23.05.5.ipk" -o -name "*_24.10.6.ipk" \) -exec basename {} \; 2>/dev/null | sort || echo "(no ipk packages)"
+          echo '```'
+          echo ""
+          echo "### 📂 OpenWRT 25.12.2 (apk / \`.apk\`)"
+          echo '```'
+          find ./release-files -name "*_25.12.2.apk" -exec basename {} \; 2>/dev/null | sort || echo "(no apk packages)"
+          echo '```'
+          echo ""
+          echo "### ⚙️ Установка"
+          echo '```bash'
+          echo '# OpenWRT 23.05 / 24.10:'
+          echo 'opkg install vk-turn-client_*.ipk'
+          echo ''
+          echo '# OpenWRT 25.12+:'
+          echo 'apk add --allow-untrusted vk-turn-client_*.apk'
+          echo '```'
+          } > notes.md
+          cat notes.md
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
