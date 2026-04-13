@@ -209,15 +209,21 @@ jobs:
           make package/custom/$PKG/compile 2>&1 | tail -n 30
           cd "$GITHUB_WORKSPACE"
 
-          # 🔍 Надёжный поиск скомпилированного пакета
+          # 🔍 Умный поиск скомпилированного пакета
           mkdir -p output
-          # 🛠️ ИСПРАВЛЕНО: OpenWRT использует дефис (-) для версии, а не подчёркивание (_)
-          PACKAGE_FILE=$(find openwrt/bin -type f -name "${PKG}-*.${PKG_EXT}" | head -n 1)
+          
+          if [ "$PKG_EXT" = "apk" ]; then
+            # Для OpenWRT 25.12+ (apk): имя-версия.apk
+            PACKAGE_FILE=$(find openwrt/bin -type f -name "${PKG}-*.${PKG_EXT}" | head -n 1)
+          else
+            # Для OpenWRT 23.05/24.10 (ipk): имя_версия_архитектура.ipk
+            PACKAGE_FILE=$(find openwrt/bin -type f -name "${PKG}_*.${PKG_EXT}" | head -n 1)
+          fi
 
           if [ -z "$PACKAGE_FILE" ]; then
-            echo "❌ ERROR: ${PKG}-*.${PKG_EXT} not found!"
+            echo "❌ ERROR: Package not found with pattern for ${PKG_EXT}!"
             echo "📂 Listing openwrt/bin/packages:"
-            find openwrt/bin/packages -type f -name "*.${PKG_EXT}" 2>/dev/null | head -20 || echo "(empty)"
+            find openwrt/bin/packages -type f -name "*.${PKG_EXT}" 2>/dev/null | head -10 || echo "(empty)"
             exit 1
           fi
 
