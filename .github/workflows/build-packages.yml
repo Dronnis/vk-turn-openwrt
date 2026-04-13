@@ -257,3 +257,45 @@ jobs:
           prerelease: false
           token: ${{ secrets.TOKEN }}
           fail_on_unmatched_files: false
+
+  # 5️⃣ Очистка старых запусков workflow (храним последние 3)
+  cleanup:
+    needs: [release]
+    if: always()  # Запускается даже если предыдущие шаги упали
+    runs-on: ubuntu-latest
+    steps:
+      - name: Delete old workflow runs
+        run: |
+          # Настройки
+          REPO="${{ github.repository }}"
+          TOKEN="${{ secrets.TOKEN }}"
+          WORKFLOW_FILE="build-packages.yml"
+          KEEP_LAST=3
+          
+          echo "🧹 Cleaning up old runs for $REPO/$WORKFLOW_FILE (keeping last $KEEP_LAST)"
+          
+          # Получаем список всех запусков нужного workflow
+          # Сортировка: newest first, чтобы первыми шли последние
+          RUNS=$(curl -sL -H "Authorization: Bearer $TOKEN" \
+            "https://api.github.com/repos/$REPO/actions/workflows/$WORKFLOW_FILE/runs?per_page=100" | jq -c '.workflow_runs')
+          
+          # Считаем общее количество
+          TOTAL=$(echo "$RUNS" | jq 'length')
+          echo "📊 Found $TOTAL total runs"
+          
+          # Если запусков больше чем нужно хранить — удаляем лишние
+          if [ "$TOTAL" -gt "$KEEP_LAST" ]; then
+            TO_DELETE=$((TOTAL - KEEP_LAST))
+            echo "🗑️ Will delete $TO_DELETE old run(s)"
+            
+            # Берём самые старые (они в конце массива) и удаляем
+            echo "$RUNS" | jq -r ".[$KEEP_LAST:] | .[].id" | while read RUN_ID; do
+              echo "🗑️ Deleting run #$RUN_ID"
+              curl -sL -X DELETE -H "Authorization: Bearer $TOKEN" \
+                "https://api.github.com/repos/$REPO/actions/runs/$RUN_ID"
+              sleep 0.5  # Небольшая пауза чтобы не упереться в rate limit
+            done
+            echo "✅ Cleanup complete"
+          else
+            echo "ℹ️ Only $TOTAL run(s) exist, nothing to delete"
+          fi
