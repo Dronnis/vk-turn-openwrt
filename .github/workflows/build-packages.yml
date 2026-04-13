@@ -22,7 +22,7 @@ env:
   UPSTREAM_REPO: kiper292/vk-turn-proxy
   VERSION_FILE: .upstream-version
   PACKAGES: "vk-turn-server vk-turn-client"
-  OPENWRT_VERSIONS: "['23.05.6', '24.10.6', '25.12.2']" 
+
 jobs:
   # 1️⃣ Проверка обновлений upstream
   check-updates:
@@ -76,138 +76,123 @@ jobs:
           git commit -m "chore: bump to upstream v${VER} [skip ci]" || echo "No changes"
           git push
 
-  # 3️⃣ Сборка пакетов под разные версии OpenWRT и архитектуры
+  # 3️⃣ Сборка пакетов
   build:
     needs: [check-updates, update-makefiles]
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        openwrt_version: ['23.05.5', '24.10.0', '25.12.0']
+        openwrt_version: ['23.05.5', '24.10.6', '25.12.2']
         package: [vk-turn-server, vk-turn-client]
         arch: [amd64, arm64, arm, mips, mipsle, 386]
       fail-fast: false
     steps:
       - uses: actions/checkout@v4
 
-      - name: Resolve SDK target & arch
+      - name: Resolve SDK info
         id: sdk_info
         run: |
-          # Маппинг: наша архитектура → target в OpenWRT SDK
-          case "${{ matrix.arch }}" in
-            amd64)
-              TARGET="x86/64"
-              UPSTREAM_ARCH="amd64"
-              ;;
-            arm64)
-              TARGET="armsr/armv8"
-              UPSTREAM_ARCH="arm64"
-              ;;
-            arm)
-              # arm_cortex-a9_vfpv3-d16 — наиболее совместимый для generic ARM
-              TARGET="mvebu/cortexa9"
-              UPSTREAM_ARCH="arm"
-              ;;
-            mips)
-              TARGET="ath79/generic"
-              UPSTREAM_ARCH="mips"
-              ;;
-            mipsle)
-              TARGET="ramips/mt7621"
-              UPSTREAM_ARCH="mipsle"
-              ;;
-            386)
-              TARGET="x86/generic"
-              UPSTREAM_ARCH="386"
-              ;;
-            *)
-              echo "❌ Unknown architecture: ${{ matrix.arch }}"
-              exit 1
-              ;;
+          OWRT="${{ matrix.openwrt_version }}"
+          ARCH="${{ matrix.arch }}"
+          
+          # Маппинг архитектур → target для SDK
+          case "$ARCH" in
+            amd64)   TARGET_PATH="x86/64";      TARGET_NAME="x86-64";      PKG_ARCH="x86_64" ;;
+            arm64)   TARGET_PATH="armsr/armv8";  TARGET_NAME="armv8";       PKG_ARCH="aarch64_generic" ;;
+            arm)     TARGET_PATH="mvebu/cortexa9"; TARGET_NAME="cortexa9";  PKG_ARCH="arm_cortex-a9_vfpv3-d16" ;;
+            mips)    TARGET_PATH="ath79/generic"; TARGET_NAME="generic";    PKG_ARCH="mips_24kc" ;;
+            mipsle)  TARGET_PATH="ramips/mt7621"; TARGET_NAME="mt7621";     PKG_ARCH="mipsel_24kc" ;;
+            386)     TARGET_PATH="x86/generic";  TARGET_NAME="generic";     PKG_ARCH="i386_pentium4" ;;
           esac
           
-          echo "target=${TARGET}" >> $GITHUB_OUTPUT
-          echo "upstream_arch=${UPSTREAM_ARCH}" >> $GITHUB_OUTPUT
-          echo "🎯 Target: ${TARGET} | Upstream binary: ${UPSTREAM_ARCH}"
+          # Определяем версию GCC и musl для каждой версии OpenWRT
+          case "$OWRT" in
+            23.05.*) GCC_VER="12.3.0"; MUSL="musl"; EXT="xz" ;;
+            24.10.*) GCC_VER="13.3.0"; MUSL="musl"; EXT="zst" ;;
+            25.12.*) GCC_VER="14.3.0"; MUSL="musl"; EXT="zst" ;;
+            *) GCC_VER="13.3.0"; MUSL="musl"; EXT="zst" ;;
+          esac
+          
+          # Определяем формат пакета
+          if [[ "$OWRT" == 25.12.* ]]; then
+            PKG_EXT="apk"
+            PKG_MGR="apk"
+          else
+            PKG_EXT="ipk"
+            PKG_MGR="opkg"
+          fi
+          
+          echo "target_path=$TARGET_PATH" >> $GITHUB_OUTPUT
+          echo "target_name=$TARGET_NAME" >> $GITHUB_OUTPUT
+          echo "pkg_arch=$PKG_ARCH" >> $GITHUB_OUTPUT
+          echo "gcc_ver=$GCC_VER" >> $GITHUB_OUTPUT
+          echo "ext=$EXT" >> $GITHUB_OUTPUT
+          echo "pkg_ext=$PKG_EXT" >> $GITHUB_OUTPUT
+          echo "pkg_mgr=$PKG_MGR" >> $GITHUB_OUTPUT
+
+      - name: Install zstd (for .tar.zst)
+        if: steps.sdk_info.outputs.ext == 'zst'
+        run: sudo apt-get update && sudo apt-get install -y zstd
 
       - name: Download OpenWRT SDK
         run: |
-          VER="${{ matrix.openwrt_version }}"
-          TARGET="${{ steps.sdk_info.outputs.target }}"
+          OWRT="${{ matrix.openwrt_version }}"
+          TARGET_PATH="${{ steps.sdk_info.outputs.target_path }}"
+          TARGET_NAME="${{ steps.sdk_info.outputs.target_name }}"
+          GCC="${{ steps.sdk_info.outputs.gcc_ver }}"
+          EXT="${{ steps.sdk_info.outputs.ext }}"
           
-          # Страница со списком файлов для target
-          BASE_URL="https://downloads.openwrt.org/releases/${VER}/targets/${TARGET}"
+          SDK_URL="https://downloads.openwrt.org/releases/${OWRT}/targets/${TARGET_PATH}/openwrt-sdk-${OWRT}-${TARGET_NAME}_gcc-${GCC}_musl.Linux-x86_64.tar.${EXT}"
           
-          # Парсим имя файла SDK (единственный файл с "sdk-" и ".tar.xz")
-          SDK_FILE=$(curl -s "${BASE_URL}/" | grep -oP 'openwrt-sdk-[^"]+\.tar\.xz' | head -1)
-          
-          if [ -z "$SDK_FILE" ]; then
-            echo "❌ SDK not found for ${VER}/${TARGET}"
-            echo "🔍 Available files:"
-            curl -s "${BASE_URL}/" | grep -oP 'href="[^"]+\.(tar\.xz|sha256sums)"' | head -20
-            exit 1
-          fi
-          
-          SDK_URL="${BASE_URL}/${SDK_FILE}"
           echo "⬇️ Downloading: $SDK_URL"
+          curl -L --retry 3 --retry-delay 5 -o sdk.tar.${EXT} "$SDK_URL"
           
-          # Скачиваем с повторными попытками
-          wget -q --timeout=60 --tries=3 -O sdk.tar.xz "$SDK_URL"
-          
-          # Проверяем контрольную сумму если есть файл
-          if curl -s -f "${SDK_URL}.sha256sums" -o checksums.txt 2>/dev/null; then
-            grep "$(basename "$SDK_FILE")" checksums.txt | sha256sum -c && echo "✅ Checksum OK" || echo "⚠️ Checksum mismatch"
+          if [ "$EXT" = "zst" ]; then
+            tar --zstd -xf sdk.tar.zst
+          else
+            tar -xf sdk.tar.xz
           fi
-          
-          tar -xf sdk.tar.xz
           mv openwrt-sdk-* openwrt
-          rm -f sdk.tar.xz checksums.txt
+          rm sdk.tar.*
 
       - name: Prepare package & build
         run: |
           VER="${{ needs.check-updates.outputs.version }}"
           PKG="${{ matrix.package }}"
           OWRT="${{ matrix.openwrt_version }}"
-          UPSTREAM_ARCH="${{ steps.sdk_info.outputs.upstream_arch }}"
+          PKG_EXT="${{ steps.sdk_info.outputs.pkg_ext }}"
+          PKG_ARCH="${{ steps.sdk_info.outputs.pkg_arch }}"
           
           # Копируем пакет в SDK
           mkdir -p openwrt/package/custom/$PKG
           cp -r packages/$PKG/* openwrt/package/custom/$PKG/
-          
-          # Обновляем версию и архитектуру в Makefile
           sed -i "s/^PKG_VERSION:=.*/PKG_VERSION:=$VER/" openwrt/package/custom/$PKG/Makefile
           
           # Настраиваем feeds
           echo "src-link custom $GITHUB_WORKSPACE/openwrt/package/custom" >> openwrt/feeds.conf.default
           
           cd openwrt
-          
-          # Обновляем и устанавливаем feeds
           ./scripts/feeds update -a 2>/dev/null || true
           ./scripts/feeds install -a 2>/dev/null || true
-          
-          # Базовая конфигурация
           make defconfig
-          
-          # Сборка пакета
           make package/custom/$PKG/compile V=s
           
-          # Сбор и переименование артефактов
+          # Копируем и переименовываем пакеты
           mkdir -p ../output
-          find bin/packages -name "${PKG}_*.ipk" -exec cp {} ../output/ \;
+          find bin/packages -name "${PKG}_*.${PKG_EXT}" -exec cp {} ../output/ \;
           cd ../output
-          
-          # Переименовываем: добавляем версию OpenWRT и архитектуру
-          for f in ${PKG}_*.ipk; do
-            NEW_NAME="${f%.ipk}_${OWRT}_${{ matrix.arch }}.ipk"
-            mv "$f" "$NEW_NAME"
-            echo "📦 Renamed: $f → $NEW_NAME"
+          for f in ${PKG}_*.${PKG_EXT}; do
+            # Формат: имя_версия-релиз_архитектура_версия-OWRT.расширение
+            base="${f%.${PKG_EXT}}"
+            mv "$f" "${base}_${OWRT}.${PKG_EXT}"
           done
+          ls -la
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.package }}-${{ matrix.arch }}-${{ matrix.openwrt_version }}
-          path: output/*.ipk
+          path: output/*.${{ steps.sdk_info.outputs.pkg_ext }}
           retention-days: 7
 
   # 4️⃣ Публикация релиза
@@ -227,25 +212,34 @@ jobs:
       - name: Generate release notes
         run: |
           VER="${{ needs.check-updates.outputs.version }}"
-          cat > notes.md <<EOF
-          ## 📦 vk-turn-proxy for OpenWRT v${VER}
+          cat > notes.md <<'HEADER'
+            ## 📦 vk-turn-proxy for OpenWRT v
+          HEADER
+          echo "HEADER" > notes.md
+          echo "## 📦 vk-turn-proxy for OpenWRT v${VER}" > notes.md
+          echo "" >> notes.md
+          echo "> Бинарники взяты из [upstream release v${VER}](https://github.com/${{ env.UPSTREAM_REPO }}/releases/tag/v${VER})" >> notes.md
+          echo "" >> notes.md
           
-          > Бинарники взяты из [upstream release v${VER}](https://github.com/${{ env.UPSTREAM_REPO }}/releases/tag/v${VER})
-          
-          ### 📂 Пакеты по версиям OpenWRT
-          EOF
-          
-          for owrt in 23.05.5 24.10.0 25.12.0; do
-            echo -e "\n#### OpenWRT ${owrt%%.*}.x" >> notes.md
+          for owrt in "23.05.5 (opkg)" "24.10.6 (opkg)" "25.12.2 (apk)"; do
+            owrt_ver="${owrt%% *}"
+            pkg_mgr="${owrt##* }"
+            pkg_ext="ipk"
+            [ "$pkg_mgr" = "apk" ] && pkg_ext="apk"
+            
+            echo -e "\n### 📂 OpenWRT ${owrt_ver} — ${pkg_mgr} (\`.${pkg_ext}\`)" >> notes.md
             echo '```' >> notes.md
-            find ./release-files -name "*_${owrt}.ipk" -exec basename {} \; | sort | sed 's/^/  /' >> notes.md
+            find ./release-files -name "*_${owrt_ver}.${pkg_ext}" -exec basename {} \; 2>/dev/null | sort | sed 's/^/  /' >> notes.md || echo "  (no packages)" >> notes.md
             echo '```' >> notes.md
           done
           
           echo -e "\n### ⚙️ Установка" >> notes.md
           echo '```bash' >> notes.md
-          echo 'wget <ссылка_на_файл.ipk>' >> notes.md
-          echo 'opkg install *.ipk' >> notes.md
+          echo '# Для OpenWRT 23.05 / 24.10 (opkg):' >> notes.md
+          echo 'opkg install vk-turn-client_*.ipk' >> notes.md
+          echo '' >> notes.md
+          echo '# Для OpenWRT 25.12+ (apk):' >> notes.md
+          echo 'apk add --allow-untrusted vk-turn-client_*.apk' >> notes.md
           echo '```' >> notes.md
 
       - name: Create GitHub Release
@@ -254,7 +248,10 @@ jobs:
           tag_name: openwrt-v${{ needs.check-updates.outputs.version }}
           name: "📦 OpenWRT Packages v${{ needs.check-updates.outputs.version }}"
           body_path: notes.md
-          files: release-files/*.ipk
+          files: |
+            release-files/*.ipk
+            release-files/*.apk
           draft: false
           prerelease: false
           token: ${{ secrets.TOKEN }}
+          fail_on_unmatched_files: false
