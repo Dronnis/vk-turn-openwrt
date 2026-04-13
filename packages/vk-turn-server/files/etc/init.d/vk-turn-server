@@ -8,6 +8,55 @@ SERVICE_WRITE_PID=1
 
 BINARY="/usr/bin/vk-turn-server"
 CONFIG="vk-turn-server"
+NAME="vk-turn-server"
+FIREWALL_NAME="vk_turn_server"
+
+add_firewall_rules() {
+    
+    [ -z "$LISTEN_PORT" ] && return 1
+    
+    logger -t "$NAME" "Adding firewall rules for port $LISTEN_PORT (TCP/UDP)"
+    
+    # Проверяем, существует ли уже правило
+    if uci -q show firewall.$FIREWALL_NAME >/dev/null 2>&1; then
+        logger -t "$FIREWALL_NAME" "Firewall rule $FIREWALL_NAME already exists, updating..."
+        uci set firewall.$FIREWALL_NAME.dest_port="$LISTEN_PORT"
+    else
+        # Создаем новое правило
+        uci set firewall.$FIREWALL_NAME=rule
+        uci set firewall.$FIREWALL_NAME.name="$FIREWALL_NAME"
+        uci set firewall.$FIREWALL_NAME.src="wan"
+        uci set firewall.$FIREWALL_NAME.dest_port="$LISTEN_PORT"
+        uci add_list firewall.$FIREWALL_NAME.proto="TCP"
+        uci add_list firewall.$FIREWALL_NAME.proto="UDP"
+        uci set firewall.$FIREWALL_NAME.target="ACCEPT"
+    fi
+    
+    uci commit firewall
+    
+    /etc/init.d/firewall reload 2>/dev/null || /etc/init.d/firewall restart 2>/dev/null
+    
+    logger -t "$NAME" "Firewall rules added successfully"
+    return 0
+}
+
+remove_firewall_rules() {
+    logger -t "$FIREWALL_NAME" "Removing firewall rules"
+    
+    if uci -q get firewall.$FIREWALL_NAME >/dev/null 2>&1; then
+        uci delete firewall.$FIREWALL_NAME
+        uci commit firewall
+        
+        /etc/init.d/firewall reload 2>/dev/null || /etc/init.d/firewall restart 2>/dev/null
+        
+        logger -t "$FIREWALL_NAME" "Firewall rules removed successfully"
+    else
+        logger -t "$FIREWALL_NAME" "Firewall rule $FIREWALL_NAME not found, nothing to remove"
+    fi
+    
+    return 0
+}
+
 
 load_config() {
 	config_load "$CONFIG"
@@ -32,7 +81,8 @@ build_args() {
 start_service() {
 	load_config
 	validate_config || return 1
-	
+    add_firewall_rules
+
 	procd_open_instance
 	procd_set_param command "$BINARY" $(build_args)
 	procd_set_param respawn
@@ -45,6 +95,9 @@ start_service() {
 }
 
 stop_service() {
+    load_config
+    remove_firewall_rules
+
 	procd_kill "vk-turn-server" 2>/dev/null
 	rm -f /var/run/vk-turn-server.pid
 }
