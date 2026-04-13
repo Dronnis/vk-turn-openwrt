@@ -211,12 +211,13 @@ jobs:
 
           # 🔍 Надёжный поиск скомпилированного пакета
           mkdir -p output
-          PACKAGE_FILE=$(find openwrt/bin -type f -name "${PKG}_*.${PKG_EXT}" | head -n 1)
+          # 🛠️ ИСПРАВЛЕНО: OpenWRT использует дефис (-) для версии, а не подчёркивание (_)
+          PACKAGE_FILE=$(find openwrt/bin -type f -name "${PKG}-*.${PKG_EXT}" | head -n 1)
 
           if [ -z "$PACKAGE_FILE" ]; then
-            echo "❌ ERROR: ${PKG}_*.${PKG_EXT} not found!"
+            echo "❌ ERROR: ${PKG}-*.${PKG_EXT} not found!"
             echo "📂 Listing openwrt/bin/packages:"
-            find openwrt/bin/packages -type f 2>/dev/null || echo "(empty)"
+            find openwrt/bin/packages -type f -name "*.${PKG_EXT}" 2>/dev/null | head -20 || echo "(empty)"
             exit 1
           fi
 
