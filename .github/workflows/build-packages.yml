@@ -112,20 +112,20 @@ jobs:
           echo "🔍 Fetching: $BASE_URL"
           PAGE=$(curl -sL "$BASE_URL")
           
-          # Парсим ссылку на SDK для нашей версии
-          SDK_LINK=$(echo "$PAGE" | grep -oP 'href="openwrt-sdk-${OWRT}-[^"]+\.tar\.(xz|zst)"' | head -1 | sed 's/href="//;s/"//')
+          # 🔧 Исправленный regex: ищем SDK файл для нашей версии
+          # Используем -E для расширенных регулярок и более простой паттерн
+          SDK_LINK=$(echo "$PAGE" | grep -oE "openwrt-sdk-${OWRT}-[^\"]+\.tar\.(xz|zst)" | head -1)
           
           if [ -z "$SDK_LINK" ]; then
             echo "❌ SDK not found for ${OWRT}/${TARGET_PATH}"
-            echo "Available archives:"
-            echo "$PAGE" | grep -oP 'href="[^"]+\.(tar\.xz|tar\.zst)"' | head -10
+            echo "🔎 Available archives containing 'sdk' or 'tar':"
+            echo "$PAGE" | grep -oE 'href="[^"]+\.(tar\.xz|tar\.zst|tar\.gz)"' | head -10 || true
             exit 1
           fi
           
-          FULL_URL="${BASE_URL}${SDK_LINK}"
-          echo "✅ SDK: $SDK_LINK"
+          echo "✅ Found SDK: $SDK_LINK"
           
-          # Определяем формат архива
+          # Определяем расширение и команду распаковки
           if [[ "$SDK_LINK" == *.zst ]]; then
             EXT="zst"
             EXTRACT_CMD="tar --zstd -xf"
@@ -134,11 +134,11 @@ jobs:
             EXTRACT_CMD="tar -xf"
           fi
           
-          echo "sdk_url=$FULL_URL" >> $GITHUB_OUTPUT
+          echo "sdk_url=${BASE_URL}${SDK_LINK}" >> $GITHUB_OUTPUT
           echo "ext=$EXT" >> $GITHUB_OUTPUT
           echo "extract_cmd=$EXTRACT_CMD" >> $GITHUB_OUTPUT
           
-          # Пакетный менеджер
+          # Пакетный менеджер и расширение пакета
           if [[ "$OWRT" == 25.12.* ]]; then
             echo "pkg_ext=apk" >> $GITHUB_OUTPUT
             echo "pkg_mgr=apk" >> $GITHUB_OUTPUT
@@ -196,7 +196,7 @@ jobs:
           name: ${{ matrix.package }}-${{ matrix.arch }}-${{ matrix.openwrt_version }}
           path: output/*.${{ steps.sdk_link.outputs.pkg_ext }}
           retention-days: 7
-          
+
   # 4️⃣ Публикация релиза
   release:
     needs: [check-updates, build]
