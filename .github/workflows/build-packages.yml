@@ -194,32 +194,42 @@ jobs:
           OWRT="${{ matrix.openwrt_version }}"
           PKG_EXT="${{ steps.sdk_link.outputs.pkg_ext }}"
 
+          # Подготовка пакета в SDK
           mkdir -p openwrt/package/custom/$PKG
           cp -r packages/$PKG/* openwrt/package/custom/$PKG/
           sed -i "s/^PKG_VERSION:=.*/PKG_VERSION:=$VER/" openwrt/package/custom/$PKG/Makefile
           echo "src-link custom $GITHUB_WORKSPACE/openwrt/package/custom" >> openwrt/feeds.conf.default
 
           cd openwrt
-          ./scripts/feeds update -a 2>/dev/null || true
-          ./scripts/feeds install -a 2>/dev/null || true
-          make defconfig
+          ./scripts/feeds update -a >/dev/null 2>&1
+          ./scripts/feeds install -a >/dev/null 2>&1
+          make defconfig >/dev/null 2>&1
+          
+          # Сборка (убран V=s, чтобы логи не обрезались GitHub)
+          make package/custom/$PKG/compile 2>&1 | tail -n 30
+          cd "$GITHUB_WORKSPACE"
 
-          # 🚀 Активируем ccache
-          export PATH="/usr/lib/ccache:$PATH"
-          export CCACHE_DIR="$HOME/.ccache"
-          export CCACHE_MAXSIZE="1G"
-          export CCACHE_COMPRESS="1"
-          export CCACHE_SLOPPINESS="file_macro,system_headers,time_macros"
+          # 🔍 Надёжный поиск скомпилированного пакета
+          mkdir -p output
+          PACKAGE_FILE=$(find openwrt/bin -type f -name "${PKG}_*.${PKG_EXT}" | head -n 1)
 
-          make package/custom/$PKG/compile Q=1
-          ccache -s 2>/dev/null || true
+          if [ -z "$PACKAGE_FILE" ]; then
+            echo "❌ ERROR: ${PKG}_*.${PKG_EXT} not found!"
+            echo "📂 Listing openwrt/bin/packages:"
+            find openwrt/bin/packages -type f 2>/dev/null || echo "(empty)"
+            exit 1
+          fi
 
-          mkdir -p ../output
-          find bin/packages -name "${PKG}_*.${PKG_EXT}" -exec cp {} ../output/ \;
-          cd ../output
-          for f in ${PKG}_*.${PKG_EXT}; do
-            mv "$f" "${f%.${PKG_EXT}}_${OWRT}.${PKG_EXT}"
-          done
+          echo "✅ Found package: $PACKAGE_FILE"
+          cp "$PACKAGE_FILE" output/
+          cd output
+
+          # Переименование с добавлением версии OpenWRT
+          ORIGINAL=$(basename "$PACKAGE_FILE")
+          NEW_NAME="${ORIGINAL%.${PKG_EXT}}_${OWRT}.${PKG_EXT}"
+          mv "$ORIGINAL" "$NEW_NAME"
+          echo "📦 Ready for upload: $NEW_NAME"
+          ls -la
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
