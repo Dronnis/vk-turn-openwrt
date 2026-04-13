@@ -1,0 +1,5 @@
+config vk-turn-server 'main'
+	option listen_address '0.0.0.0'
+	option listen_port '56000'
+	option connect_address '127.0.0.1'
+	option connect_port '51210'

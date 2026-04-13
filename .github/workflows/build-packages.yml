@@ -1,0 +1,201 @@
+name: Build OpenWRT Packages (23.05 / 24.10 / 25.12)
+
+on:
+  schedule:
+    - cron: '*/30 * * * *'
+  push:
+    branches: [main]
+    paths:
+      - 'packages/**/Makefile'
+      - '.github/workflows/**'
+  workflow_dispatch:
+    inputs:
+      force_rebuild:
+        description: 'Force rebuild'
+        type: boolean
+        default: false
+      target_version:
+        description: 'Upstream version to build (e.g., 2.0.6)'
+        type: string
+
+env:
+  UPSTREAM_REPO: kiper292/vk-turn-proxy
+  VERSION_FILE: .upstream-version
+  PACKAGES: "vk-turn-server vk-turn-client"
+  OPENWRT_VERSIONS: "['23.05.6', '24.10.6', '25.12.2']" 
+jobs:
+  # 1️⃣ Проверка обновлений upstream
+  check-updates:
+    runs-on: ubuntu-latest
+    outputs:
+      build: ${{ steps.check.outputs.build }}
+      version: ${{ steps.check.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Get latest upstream version
+        id: check
+        run: |
+          LATEST=$(curl -s https://api.github.com/repos/${{ env.UPSTREAM_REPO }}/releases/latest | jq -r .tag_name | sed 's/^v//')
+          CURRENT=$(cat ${{ env.VERSION_FILE }} 2>/dev/null || echo "0.0.0")
+          FORCE="${{ github.event.inputs.force_rebuild }}"
+          TARGET="${{ github.event.inputs.target_version }}"
+          
+          echo "🔍 Upstream: $LATEST | Packaged: $CURRENT"
+          
+          if [ -n "$TARGET" ]; then
+            echo "build=true" >> $GITHUB_OUTPUT
+            echo "version=$TARGET" >> $GITHUB_OUTPUT
+          elif [ "$LATEST" != "$CURRENT" ] || [ "$FORCE" = "true" ]; then
+            echo "build=true" >> $GITHUB_OUTPUT
+            echo "version=$LATEST" >> $GITHUB_OUTPUT
+          else
+            echo "build=false" >> $GITHUB_OUTPUT
+          fi
+
+  # 2️⃣ Обновление PKG_VERSION в Makefile
+  update-makefiles:
+    needs: check-updates
+    if: needs.check-updates.outputs.build == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+      
+      - name: Bump PKG_VERSION
+        run: |
+          VER="${{ needs.check-updates.outputs.version }}"
+          for pkg in ${{ env.PACKAGES }}; do
+            sed -i "s/^PKG_VERSION:=.*/PKG_VERSION:=$VER/" "packages/$pkg/Makefile"
+          done
+          echo "$VER" > ${{ env.VERSION_FILE }}
+          
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add packages/*/Makefile ${{ env.VERSION_FILE }}
+          git commit -m "chore: bump to upstream v${VER} [skip ci]" || echo "No changes"
+          git push
+
+  # 3️⃣ Сборка пакетов под разные версии OpenWRT и архитектуры
+  build:
+    needs: [check-updates, update-makefiles]
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        openwrt_version: ['23.05.5', '24.10.0', '25.12.0']
+        package: [vk-turn-server, vk-turn-client]
+        arch: [amd64, arm64, arm, mips, mipsle, 386]
+      fail-fast: false
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve SDK target & arch
+        id: sdk_info
+        run: |
+          case "${{ matrix.arch }}" in
+            amd64)   TARGET="x86/64";           SDK_ARCH="x86_64" ;;
+            arm64)   TARGET="armsr/armv8";      SDK_ARCH="aarch64_generic" ;;
+            arm)     TARGET="mvebu/cortexa9";   SDK_ARCH="arm_cortex-a9_vfpv3-d16" ;;
+            mips)    TARGET="ath79/generic";    SDK_ARCH="mips_24kc" ;;
+            mipsle)  TARGET="ramips/mt7621";    SDK_ARCH="mipsel_24kc" ;;
+            386)     TARGET="x86/generic";      SDK_ARCH="i386_pentium4" ;;
+          esac
+          echo "target=$TARGET" >> $GITHUB_OUTPUT
+          echo "sdk_arch=$SDK_ARCH" >> $GITHUB_OUTPUT
+
+      - name: Download OpenWRT SDK
+        run: |
+          VER="${{ matrix.openwrt_version }}"
+          TARGET="${{ steps.sdk_info.outputs.target }}"
+          SDK_ARCH="${{ steps.sdk_info.outputs.sdk_arch }}"
+          SDK_URL="https://downloads.openwrt.org/releases/${VER}/targets/${TARGET}/openwrt-sdk-${VER}-${SDK_ARCH}_Linux-x86_64.tar.xz"
+          
+          echo "⬇️ Downloading SDK: $SDK_URL"
+          wget -q --timeout=30 --tries=3 -O sdk.tar.xz "$SDK_URL"
+          tar -xf sdk.tar.xz
+          mv openwrt-sdk-* openwrt
+          rm sdk.tar.xz
+
+      - name: Prepare package & build
+        run: |
+          VER="${{ needs.check-updates.outputs.version }}"
+          PKG="${{ matrix.package }}"
+          OWRT="${{ matrix.openwrt_version }}"
+          
+          # Копируем пакет в SDK
+          mkdir -p openwrt/package/custom/$PKG
+          cp -r packages/$PKG/* openwrt/package/custom/$PKG/
+          sed -i "s/^PKG_VERSION:=.*/PKG_VERSION:=$VER/" openwrt/package/custom/$PKG/Makefile
+          
+          # Настраиваем feeds
+          echo "src-link custom $GITHUB_WORKSPACE/openwrt/package/custom" >> openwrt/feeds.conf.default
+          
+          cd openwrt
+          ./scripts/feeds update -a 2>/dev/null
+          ./scripts/feeds install -a 2>/dev/null
+          make defconfig
+          make package/custom/$PKG/compile V=s
+          
+          # Переименовываем с указанием версии OpenWRT
+          mkdir -p ../output
+          find bin/packages -name "${PKG}_*.ipk" -exec cp {} ../output/ \;
+          cd ../output
+          for f in ${PKG}_*.ipk; do
+            mv "$f" "${f%.ipk}_${OWRT}.ipk"
+          done
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.package }}-${{ matrix.arch }}-${{ matrix.openwrt_version }}
+          path: output/*.ipk
+          retention-days: 7
+
+  # 4️⃣ Публикация релиза
+  release:
+    needs: [check-updates, build]
+    if: needs.check-updates.outputs.build == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: ./release-files
+          merge-multiple: true
+
+      - name: Generate release notes
+        run: |
+          VER="${{ needs.check-updates.outputs.version }}"
+          cat > notes.md <<EOF
+          ## 📦 vk-turn-proxy for OpenWRT v${VER}
+          
+          > Бинарники взяты из [upstream release v${VER}](https://github.com/${{ env.UPSTREAM_REPO }}/releases/tag/v${VER})
+          
+          ### 📂 Пакеты по версиям OpenWRT
+          EOF
+          
+          for owrt in 23.05.5 24.10.0 25.12.0; do
+            echo -e "\n#### OpenWRT ${owrt%%.*}.x" >> notes.md
+            echo '```' >> notes.md
+            find ./release-files -name "*_${owrt}.ipk" -exec basename {} \; | sort | sed 's/^/  /' >> notes.md
+            echo '```' >> notes.md
+          done
+          
+          echo -e "\n### ⚙️ Установка" >> notes.md
+          echo '```bash' >> notes.md
+          echo 'wget <ссылка_на_файл.ipk>' >> notes.md
+          echo 'opkg install *.ipk' >> notes.md
+          echo '```' >> notes.md
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: openwrt-v${{ needs.check-updates.outputs.version }}
+          name: "📦 OpenWRT Packages v${{ needs.check-updates.outputs.version }}"
+          body_path: notes.md
+          files: release-files/*.ipk
+          draft: false
+          prerelease: false
+          token: ${{ secrets.GITHUB_TOKEN }}
