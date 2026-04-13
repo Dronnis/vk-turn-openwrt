@@ -92,56 +92,115 @@ jobs:
       - name: Resolve SDK target & arch
         id: sdk_info
         run: |
+          # Маппинг: наша архитектура → target в OpenWRT SDK
           case "${{ matrix.arch }}" in
-            amd64)   TARGET="x86/64";           SDK_ARCH="x86_64" ;;
-            arm64)   TARGET="armsr/armv8";      SDK_ARCH="aarch64_generic" ;;
-            arm)     TARGET="mvebu/cortexa9";   SDK_ARCH="arm_cortex-a9_vfpv3-d16" ;;
-            mips)    TARGET="ath79/generic";    SDK_ARCH="mips_24kc" ;;
-            mipsle)  TARGET="ramips/mt7621";    SDK_ARCH="mipsel_24kc" ;;
-            386)     TARGET="x86/generic";      SDK_ARCH="i386_pentium4" ;;
+            amd64)
+              TARGET="x86/64"
+              UPSTREAM_ARCH="amd64"
+              ;;
+            arm64)
+              TARGET="armsr/armv8"
+              UPSTREAM_ARCH="arm64"
+              ;;
+            arm)
+              # arm_cortex-a9_vfpv3-d16 — наиболее совместимый для generic ARM
+              TARGET="mvebu/cortexa9"
+              UPSTREAM_ARCH="arm"
+              ;;
+            mips)
+              TARGET="ath79/generic"
+              UPSTREAM_ARCH="mips"
+              ;;
+            mipsle)
+              TARGET="ramips/mt7621"
+              UPSTREAM_ARCH="mipsle"
+              ;;
+            386)
+              TARGET="x86/generic"
+              UPSTREAM_ARCH="386"
+              ;;
+            *)
+              echo "❌ Unknown architecture: ${{ matrix.arch }}"
+              exit 1
+              ;;
           esac
-          echo "target=$TARGET" >> $GITHUB_OUTPUT
-          echo "sdk_arch=$SDK_ARCH" >> $GITHUB_OUTPUT
+          
+          echo "target=${TARGET}" >> $GITHUB_OUTPUT
+          echo "upstream_arch=${UPSTREAM_ARCH}" >> $GITHUB_OUTPUT
+          echo "🎯 Target: ${TARGET} | Upstream binary: ${UPSTREAM_ARCH}"
 
       - name: Download OpenWRT SDK
         run: |
           VER="${{ matrix.openwrt_version }}"
           TARGET="${{ steps.sdk_info.outputs.target }}"
-          SDK_ARCH="${{ steps.sdk_info.outputs.sdk_arch }}"
-          SDK_URL="https://downloads.openwrt.org/releases/${VER}/targets/${TARGET}/openwrt-sdk-${VER}-${SDK_ARCH}_Linux-x86_64.tar.xz"
           
-          echo "⬇️ Downloading SDK: $SDK_URL"
-          wget -q --timeout=30 --tries=3 -O sdk.tar.xz "$SDK_URL"
+          # Страница со списком файлов для target
+          BASE_URL="https://downloads.openwrt.org/releases/${VER}/targets/${TARGET}"
+          
+          # Парсим имя файла SDK (единственный файл с "sdk-" и ".tar.xz")
+          SDK_FILE=$(curl -s "${BASE_URL}/" | grep -oP 'openwrt-sdk-[^"]+\.tar\.xz' | head -1)
+          
+          if [ -z "$SDK_FILE" ]; then
+            echo "❌ SDK not found for ${VER}/${TARGET}"
+            echo "🔍 Available files:"
+            curl -s "${BASE_URL}/" | grep -oP 'href="[^"]+\.(tar\.xz|sha256sums)"' | head -20
+            exit 1
+          fi
+          
+          SDK_URL="${BASE_URL}/${SDK_FILE}"
+          echo "⬇️ Downloading: $SDK_URL"
+          
+          # Скачиваем с повторными попытками
+          wget -q --timeout=60 --tries=3 -O sdk.tar.xz "$SDK_URL"
+          
+          # Проверяем контрольную сумму если есть файл
+          if curl -s -f "${SDK_URL}.sha256sums" -o checksums.txt 2>/dev/null; then
+            grep "$(basename "$SDK_FILE")" checksums.txt | sha256sum -c && echo "✅ Checksum OK" || echo "⚠️ Checksum mismatch"
+          fi
+          
           tar -xf sdk.tar.xz
           mv openwrt-sdk-* openwrt
-          rm sdk.tar.xz
+          rm -f sdk.tar.xz checksums.txt
 
       - name: Prepare package & build
         run: |
           VER="${{ needs.check-updates.outputs.version }}"
           PKG="${{ matrix.package }}"
           OWRT="${{ matrix.openwrt_version }}"
+          UPSTREAM_ARCH="${{ steps.sdk_info.outputs.upstream_arch }}"
           
           # Копируем пакет в SDK
           mkdir -p openwrt/package/custom/$PKG
           cp -r packages/$PKG/* openwrt/package/custom/$PKG/
+          
+          # Обновляем версию и архитектуру в Makefile
           sed -i "s/^PKG_VERSION:=.*/PKG_VERSION:=$VER/" openwrt/package/custom/$PKG/Makefile
           
           # Настраиваем feeds
           echo "src-link custom $GITHUB_WORKSPACE/openwrt/package/custom" >> openwrt/feeds.conf.default
           
           cd openwrt
-          ./scripts/feeds update -a 2>/dev/null
-          ./scripts/feeds install -a 2>/dev/null
+          
+          # Обновляем и устанавливаем feeds
+          ./scripts/feeds update -a 2>/dev/null || true
+          ./scripts/feeds install -a 2>/dev/null || true
+          
+          # Базовая конфигурация
           make defconfig
+          
+          # Сборка пакета
           make package/custom/$PKG/compile V=s
           
-          # Переименовываем с указанием версии OpenWRT
+          # Сбор и переименование артефактов
           mkdir -p ../output
           find bin/packages -name "${PKG}_*.ipk" -exec cp {} ../output/ \;
           cd ../output
+          
+          # Переименовываем: добавляем версию OpenWRT и архитектуру
           for f in ${PKG}_*.ipk; do
-            mv "$f" "${f%.ipk}_${OWRT}.ipk"
+            NEW_NAME="${f%.ipk}_${OWRT}_${{ matrix.arch }}.ipk"
+            mv "$f" "$NEW_NAME"
+            echo "📦 Renamed: $f → $NEW_NAME"
           done
 
       - name: Upload artifact
