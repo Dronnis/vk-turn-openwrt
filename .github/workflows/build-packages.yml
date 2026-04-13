@@ -130,38 +130,62 @@ jobs:
             echo "pkg_ext=ipk" >> $GITHUB_OUTPUT
           fi
 
-      - name: Install zstd if needed
-        if: steps.sdk_link.outputs.ext == 'zst'
-        run: sudo apt-get update && sudo apt-get install -y zstd
-
-      - name: Download & extract SDK
+      - name: Install dependencies
         run: |
-          curl -L --retry 3 -o "sdk.tar.${{ steps.sdk_link.outputs.ext }}" "${{ steps.sdk_link.outputs.sdk_url }}"
-          ${{ steps.sdk_link.outputs.extract_cmd }} "sdk.tar.${{ steps.sdk_link.outputs.ext }}"
-          mv openwrt-sdk-* openwrt
-          rm -f sdk.tar.*
-          mkdir -p openwrt/dl
+          sudo apt-get update
+          [[ "${{ steps.sdk_link.outputs.ext }}" == "zst" ]] && sudo apt-get install -y zstd
+          sudo apt-get install -y ccache
 
-      # 🔥 Кэш 1: Скачанные исходники (dl/)
+      # 🔥 Кэш 1: Извлечённый SDK (ключ жёстко привязан к версии+архитектуре)
+      - name: Cache OpenWRT SDK
+        id: cache-sdk
+        uses: actions/cache@v4
+        with:
+          path: sdk-cache/${{ matrix.openwrt_version }}-${{ matrix.arch }}
+          key: sdk-${{ matrix.openwrt_version }}-${{ matrix.arch }}
+          restore-keys: |
+            sdk-${{ matrix.openwrt_version }}-
+
+      - name: Download & Prepare SDK
+        run: |
+          OWRT="${{ matrix.openwrt_version }}"
+          ARCH="${{ matrix.arch }}"
+          EXT="${{ steps.sdk_link.outputs.ext }}"
+          EXTRACT_CMD="${{ steps.sdk_link.outputs.extract_cmd }}"
+          SDK_URL="${{ steps.sdk_link.outputs.sdk_url }}"
+          SDK_CACHE="sdk-cache/${OWRT}-${ARCH}"
+
+          if [ -d "$SDK_CACHE" ]; then
+            echo "📦 Restoring SDK from cache..."
+            cp -r "$SDK_CACHE" openwrt
+          else
+            echo "⬇️ Downloading & extracting SDK..."
+            curl -L --retry 3 -o sdk.tar.${EXT} "$SDK_URL"
+            $EXTRACT_CMD sdk.tar.${EXT}
+            mv openwrt-sdk-* openwrt
+            rm -f sdk.tar.*
+            # Сохраняем чистую копию SDK для будущего кэширования
+            mkdir -p sdk-cache
+            cp -r openwrt "$SDK_CACHE"
+          fi
+
+      # 🔥 Кэш 2: Исходники пакетов (dl/)
       - name: Cache OpenWRT downloads
         uses: actions/cache@v4
         with:
           path: openwrt/dl
-          key: owrt-dl-${{ matrix.openwrt_version }}-${{ hashFiles('packages/**/Makefile') }}
+          key: dl-${{ matrix.openwrt_version }}
           restore-keys: |
-            owrt-dl-${{ matrix.openwrt_version }}-
+            dl-${{ matrix.openwrt_version }}-
 
-      # 🔥 Кэш 2: Компилятор (ccache)
+      # 🔥 Кэш 3: Компилятор (ccache)
       - name: Cache ccache
         uses: actions/cache@v4
         with:
           path: ~/.ccache
-          key: ccache-${{ matrix.openwrt_version }}-${{ matrix.arch }}-${{ hashFiles('packages/**/Makefile') }}
+          key: ccache-${{ matrix.openwrt_version }}-${{ matrix.arch }}
           restore-keys: |
             ccache-${{ matrix.openwrt_version }}-${{ matrix.arch }}-
-
-      - name: Install ccache
-        run: sudo apt-get update && sudo apt-get install -y ccache
 
       - name: Prepare package & compile
         run: |
@@ -173,7 +197,6 @@ jobs:
           mkdir -p openwrt/package/custom/$PKG
           cp -r packages/$PKG/* openwrt/package/custom/$PKG/
           sed -i "s/^PKG_VERSION:=.*/PKG_VERSION:=$VER/" openwrt/package/custom/$PKG/Makefile
-
           echo "src-link custom $GITHUB_WORKSPACE/openwrt/package/custom" >> openwrt/feeds.conf.default
 
           cd openwrt
@@ -189,8 +212,6 @@ jobs:
           export CCACHE_SLOPPINESS="file_macro,system_headers,time_macros"
 
           make package/custom/$PKG/compile V=s
-
-          # Статистика кэша (для отладки)
           ccache -s 2>/dev/null || true
 
           mkdir -p ../output
@@ -206,7 +227,8 @@ jobs:
           name: ${{ matrix.package }}-${{ matrix.arch }}-${{ matrix.openwrt_version }}
           path: output/*.${{ steps.sdk_link.outputs.pkg_ext }}
           retention-days: 7
-  # 4️⃣ Публикация релиза
+
+# 4️⃣ Публикация релиза
   release:
     needs: [check-updates, build]
     if: needs.check-updates.outputs.build == 'true'
