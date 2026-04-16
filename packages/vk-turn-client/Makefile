@@ -1,7 +1,7 @@
 include $(TOPDIR)/rules.mk
 
 PKG_NAME:=vk-turn-client
-PKG_VERSION:=2.0.6
+PKG_VERSION:=2.0.7
 PKG_RELEASE:=1
 PKG_BUILD_PARALLEL:=0
 
